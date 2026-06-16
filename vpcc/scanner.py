@@ -583,6 +583,22 @@ def auto_heal_drift(text: str, patch_dir: Path, verbose: bool = False) -> dict[s
             details.append({"id": p["id"], "action": "failed", "reason": "replacement longer than match"})
             continue
 
+        # The patcher pads short replacements with spaces to keep the binary size
+        # fixed. A derived regex whose match is far longer than the replacement
+        # would force a huge pad that blanks real adjacent code and corrupts the
+        # bundle. Refuse to write such a heal — leaving the patch as drift is
+        # honest and safe; a corrupting auto-heal is not. (Mirrors the patcher's
+        # MAX_INPLACE_PADDING backstop.)
+        _MAX_HEAL_PADDING = 64
+        if len(m.group(0)) - len(replace_str) > _MAX_HEAL_PADDING:
+            failed += 1
+            if verbose:
+                print(f"  SKIP {p['id']}: derived match ({len(m.group(0))}) too wide for "
+                      f"replacement ({len(replace_str)}) — would over-pad")
+            details.append({"id": p["id"], "action": "failed",
+                            "reason": "derived match too wide for replacement (would over-pad)"})
+            continue
+
         sub["search_regex"] = new_regex
         # Don't blindly set replace to the regex — that's an identity no-op
         # that destroys the actual replacement intent. Leave replace as-is.

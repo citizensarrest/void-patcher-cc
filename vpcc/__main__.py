@@ -47,6 +47,34 @@ else:
 _PKG = "@anthropic-ai/claude-code"
 _BUN_SECTION = ".bun"
 
+# Ceiling on space-padding for FALLBACK-applied patches (matches found outside the
+# active-bundle window). Hand-authored patches in the active window are trusted to
+# pad as much as they were authored to; but a fallback match lands in the mixed
+# bytecode/VFS tail, where over-padding — or patching compiled bytecode at all —
+# corrupts Bun's module loader ("Expected CommonJS module to have a function
+# wrapper" crash). Fallback applies are gated by this cap plus a printability check.
+MAX_INPLACE_PADDING = 64
+
+
+def _fallback_apply_safe(data, start: int, length: int, padding: int) -> bool:
+    """Gate for applying a patch match found via the whole-section fallback.
+
+    Fallback matches live outside the active-bundle window, in a region that mixes
+    compiled Bun bytecode with a VFS text copy of the source. Only patch when the
+    pad is modest AND the surrounding bytes are printable JS source (never compiled
+    bytecode, whose binary bytes would be silently corrupted by an overwrite).
+    """
+    if padding > MAX_INPLACE_PADDING:
+        return False
+    lo = max(0, start - 64)
+    hi = min(len(data), start + length + 64)
+    window = data[lo:hi]
+    if not window:
+        return False
+    printable = sum(1 for b in window if 0x20 <= b < 0x7f or b in (9, 10, 13))
+    return printable >= 0.95 * len(window)
+
+
 
 # ── target discovery ─────────────────────────────────────────────────────────
 
@@ -569,6 +597,7 @@ def patch_bun_sea_inplace(binary: Path, patches: list) -> dict:
                     m = pat.search(section_view)
                     abs_start = eff_lo + m.start() if m else None
                     mb = m.group(0) if m else None
+                    via_fallback = False
                     if m is None:
                         # Bounds-window fallback: some 2.1.178+ layouts interleave
                         # multiple bytecode blobs with active source, so the active
@@ -582,6 +611,7 @@ def patch_bun_sea_inplace(binary: Path, patches: list) -> dict:
                             m = hits[0]
                             abs_start = bun_lo + m.start()
                             mb = m.group(0)
+                            via_fallback = True
                     if m:
                         try:
                             rb = m.expand(replace.encode("utf-8", "surrogateescape"))
@@ -591,8 +621,11 @@ def patch_bun_sea_inplace(binary: Path, patches: list) -> dict:
                         if len(rb) > len(mb):
                             skipped_n += 1
                             continue
-                        if len(rb) < len(mb):
-                            padding = len(mb) - len(rb)
+                        padding = len(mb) - len(rb)
+                        if via_fallback and not _fallback_apply_safe(data, abs_start, len(mb), padding):
+                            skipped_n += 1
+                            continue
+                        if padding:
                             rb = rb + b" " * padding
                             if padding > max_padding:
                                 max_padding = padding
@@ -604,13 +637,10 @@ def patch_bun_sea_inplace(binary: Path, patches: list) -> dict:
                     if len(r_b) > len(s_b):
                         skipped_n += 1
                         continue
-                    if len(r_b) < len(s_b):
-                        padding = len(s_b) - len(r_b)
-                        r_b = r_b + b" " * padding
-                        if padding > max_padding:
-                            max_padding = padding
+                    padding = len(s_b) - len(r_b)
                     # Apply to the FIRST occurrence only (same VFS-safety reason
                     # as above).
+                    via_fallback = False
                     j = data.find(s_b, eff_lo, eff_hi)
                     if j < 0:
                         # Bounds-window fallback (see regex branch above): only
@@ -618,7 +648,15 @@ def patch_bun_sea_inplace(binary: Path, patches: list) -> dict:
                         first = data.find(s_b, bun_lo, bun_hi)
                         if first >= 0 and data.find(s_b, first + 1, bun_hi) < 0:
                             j = first
+                            via_fallback = True
                     if j >= 0:
+                        if via_fallback and not _fallback_apply_safe(data, j, len(s_b), padding):
+                            skipped_n += 1
+                            continue
+                        if padding:
+                            r_b = r_b + b" " * padding
+                            if padding > max_padding:
+                                max_padding = padding
                         data[j:j + len(s_b)] = r_b
                         applied_n += 1
 
