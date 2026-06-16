@@ -567,8 +567,22 @@ def patch_bun_sea_inplace(binary: Path, patches: list) -> dict:
                     # Applying to every match would also corrupt the VFS copy,
                     # breaking Bun's module loader ("CommonJS wrapper" crash).
                     m = pat.search(section_view)
+                    abs_start = eff_lo + m.start() if m else None
+                    mb = m.group(0) if m else None
+                    if m is None:
+                        # Bounds-window fallback: some 2.1.178+ layouts interleave
+                        # multiple bytecode blobs with active source, so the active
+                        # entry point can sit past the first `// @bun @bytecode`
+                        # marker our window stops at. Re-search the WHOLE section;
+                        # only commit if the match is unique (count==1), which rules
+                        # out hitting the VFS-duplicated copy.
+                        full_view = bytes(data[bun_lo:bun_hi])
+                        hits = list(pat.finditer(full_view))
+                        if len(hits) == 1:
+                            m = hits[0]
+                            abs_start = bun_lo + m.start()
+                            mb = m.group(0)
                     if m:
-                        mb = m.group(0)
                         try:
                             rb = m.expand(replace.encode("utf-8", "surrogateescape"))
                         except Exception:
@@ -582,7 +596,6 @@ def patch_bun_sea_inplace(binary: Path, patches: list) -> dict:
                             rb = rb + b" " * padding
                             if padding > max_padding:
                                 max_padding = padding
-                        abs_start = eff_lo + m.start()
                         data[abs_start:abs_start + len(mb)] = rb
                         applied_n += 1
                 elif search:
@@ -599,6 +612,12 @@ def patch_bun_sea_inplace(binary: Path, patches: list) -> dict:
                     # Apply to the FIRST occurrence only (same VFS-safety reason
                     # as above).
                     j = data.find(s_b, eff_lo, eff_hi)
+                    if j < 0:
+                        # Bounds-window fallback (see regex branch above): only
+                        # commit if the literal is unique across the whole section.
+                        first = data.find(s_b, bun_lo, bun_hi)
+                        if first >= 0 and data.find(s_b, first + 1, bun_hi) < 0:
+                            j = first
                     if j >= 0:
                         data[j:j + len(s_b)] = r_b
                         applied_n += 1
